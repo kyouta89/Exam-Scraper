@@ -74,6 +74,12 @@ def main():
             
             en_html = str(q_body_div)
 
+            # ========== 【追加修正ここから】 ==========
+            # 翻訳の邪魔になる「Most Voted」バッジをここで削除します
+            for badge in q_body_div.find_all(class_='most-voted-answer-badge'):
+                badge.decompose()
+            # ========================================
+
             # 翻訳処理
             try:
                 # 本文
