@@ -11,13 +11,12 @@ load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
 INPUT_FILE = 'CIS-CSM_Complete_Questions.html'
-OUTPUT_HTML = 'CIS-CSM_Master_Textbook_AI_SplitOnly.html' 
+OUTPUT_HTML = 'CIS-CSM_Master_Textbook_AI_test.html' 
 MODEL_ID = 'models/gemini-2.5-pro' 
 
 # 'ALL':全問, 'SPLIT_ONLY':意見割れのみ, 'NONE':翻訳のみ
 AI_TARGET_MODE = 'SPLIT_ONLY' 
-
-TEST_LIMIT = 1000
+TEST_LIMIT = 10  # None = 全問処理, 数値 = 問題数制限
 # ------------------
 
 def init_client():
@@ -77,9 +76,11 @@ def main():
     translator = GoogleTranslator(source='auto', target='ja')
     
     process_count = 0
+    total_cards = len(cards)
+    print(f"📊 全問題数: {total_cards}問")
 
     for i, card in enumerate(cards):
-        if process_count >= TEST_LIMIT:
+        if TEST_LIMIT is not None and process_count >= TEST_LIMIT:
             print(f"\n🛑 制限 ({TEST_LIMIT}問) に達しました。")
             break
 
@@ -87,20 +88,59 @@ def main():
         suggested_match = re.search(r'Suggested Answer:\s*([A-Za-z]+)', full_text)
         suggested_ans = suggested_match.group(1) if suggested_match else "-"
         
-        vote_bar = card.find('div', class_='vote-bar')
-        vote_detail = vote_bar.get_text(strip=True) if vote_bar else "投票なし"
-        vote_match = re.match(r'([A-Za-z]+)', vote_detail)
-        vote_ans = vote_match.group(1) if vote_match else "-"
+        # 投票情報の詳細を取得（display:none を除外）
+        vote_bars = card.find_all('div', class_='vote-bar')
+        vote_distribution = []
+        vote_ans = "-"
         
-        is_split = (vote_ans != "-" and suggested_ans != vote_ans)
+        for bar in vote_bars:
+            # display: none の要素はスキップ
+            style_attr = bar.get('style', '')
+            if 'display: none' in style_attr or 'display:none' in style_attr:
+                continue
+                
+            vote_text = bar.get_text(strip=True)
+            if vote_text and '(' in vote_text and ')' in vote_text:
+                # "A (100%)" のような形式から抽出
+                match = re.match(r'([A-Z]+)\s*\((\d+)%\)', vote_text)
+                if match:
+                    choice = match.group(1)
+                    percentage = match.group(2)
+                    # 投票数を取得
+                    votes_attr = bar.get('data-original-title', '')
+                    votes_match = re.search(r'(\d+)\s*vote', votes_attr)
+                    votes_count = votes_match.group(1) if votes_match else "?"
+                    vote_distribution.append(f"{choice}: {percentage}% ({votes_count}票)")
+                    
+                    # 最初の（最も多い）投票を vote_ans とする
+                    if vote_ans == "-":
+                        vote_ans = choice
+        
+        vote_detail_html = "<br>".join(vote_distribution) if vote_distribution else "投票なし"
+        
+        # コミュニティ内で意見が割れているか判定（複数の選択肢に投票がある）
+        is_community_split = len(vote_distribution) > 1
+        
+        # サイト解答とコミュニティ最多投票が異なるか判定
+        is_site_community_split = (vote_ans != "-" and suggested_ans != vote_ans)
         
         should_run_ai = False
-        if AI_TARGET_MODE == 'ALL': should_run_ai = True
+        if AI_TARGET_MODE == 'ALL': 
+            should_run_ai = True
         elif AI_TARGET_MODE == 'SPLIT_ONLY':
-            if is_split: should_run_ai = True
+            # サイトとコミュニティの意見が割れている、またはコミュニティ内で意見が割れている
+            if is_site_community_split or is_community_split: 
+                should_run_ai = True
         
-        status_icon = "⚠️" if is_split else "✅"
-        print(f"   [{i+1}] {status_icon} Ans:{suggested_ans} / Vote:{vote_ans} -> AI生成: {'ON' if should_run_ai else 'OFF'} ...", end="\r")
+        # アイコン表示：サイトとコミュニティが割れている場合は⚠️、コミュニティ内だけの割れは🤔
+        if is_site_community_split:
+            status_icon = "⚠️"
+        elif is_community_split:
+            status_icon = "🤔"
+        else:
+            status_icon = "✅"
+        
+        print(f"   [{i+1}] {status_icon} Ans:{suggested_ans} / Vote:{vote_ans} ({len(vote_distribution)}選択肢) -> AI生成: {'ON' if should_run_ai else 'OFF'} ...", end="\r")
         process_count += 1
 
         q_num = 9999
@@ -120,31 +160,32 @@ def main():
         if q_body_div:
             # ① 先にゴミを削除する
             for trash in q_body_div.find_all(['script', 'style', 'button', 'div']):
+                # 【追加】安全策: 属性データがない要素はスキップする
+                if not hasattr(trash, 'attrs') or trash.attrs is None:
+                    continue
+
                 # クラス判定を少し緩くしてヒットしやすくする（in判定に変更）
                 trash_classes = trash.get('class', [])
                 if any(c in ['question-answer', 'voting-summary', 'vote-bar'] for c in trash_classes):
                     trash.decompose()
             
-            # ② きれいになった状態でテキストを取得する
+            # ② 投票バッジ（Most Votedなど）を削除する
+            for badge in q_body_div.find_all(['span', 'div'], class_=['badge', 'most-voted-answer-badge', 'vote-distribution-bar', 'voted-answers-tally']):
+                badge.decompose()
+            
+            # ③ "Most Voted"テキストを含む要素を削除
+            for element in q_body_div.find_all(string=lambda text: text and "Most Voted" in text):
+                # テキストノードそのものを空文字に置換
+                element.replace_with("")
+            
+            # ④ きれいになった状態でテキストを取得する
             clean_text_for_ai = q_body_div.get_text("\n", strip=True)
             en_html = str(q_body_div)
 
             try:
                 p_text = q_body_div.find('p', class_='card-text')
                 if p_text:
-
-                    # --- 【追加】翻訳前に不要なバッジやスパンを削除する ---
-                    # 投票バッジや不要な補足テキストが含まれるクラスを指定して削除
-                    # サイトの仕様変更に対応できるよう、汎用的な span もチェック対象にするか検討が必要ですが
-                    # まずは 'vote-distribution-bar', 'badge' などを狙い撃ちします
-                    for badge in p_text.find_all(['span', 'div'], class_=['vote-distribution-bar', 'badge', 'voted-answers-tally']):
-                        badge.decompose()
-                    
-                    # 念のため、"Most Voted" というテキストを持つ要素を強力に削除
-                    for element in p_text.find_all(string=lambda text: text and "Most Voted" in text):
-                        element.parent.decompose() # そのテキストを含む親タグごと削除
-                    # ----------------------------------------------------
-
+                    # 既に上で削除済みなので、この部分は不要になりました
                     txt = p_text.get_text(strip=True)
                     if txt:
                         trans = translator.translate(txt)
@@ -174,7 +215,14 @@ def main():
             ai_html = ai_text.replace("\n", "<br>")
             time.sleep(5)
 
-        warning_tag = "<span class='warning'>⚠️ 意見割れ</span>" if is_split else ""
+        # 警告タグの表示を改善
+        if is_site_community_split:
+            warning_tag = "<span class='warning'>⚠️ サイトと投票で意見割れ</span>"
+        elif is_community_split:
+            warning_tag = "<span class='warning-community'>🤔 コミュニティ内で意見割れ</span>"
+        else:
+            warning_tag = ""
+            
         card_html = f"""
         <div class="question-card" id="q{q_num}">
             <div class="q-header">
@@ -188,7 +236,7 @@ def main():
             <div id="en-area-{q_num}" class="q-content en-area" style="display:none;">{en_html}</div>
             <div id="ans-area-{q_num}" class="answer-section" style="display:none;">
                 <div class="ans-box"><span class="ans-label">サイト解答</span><span class="ans-value">{suggested_ans}</span></div>
-                <div class="ans-box community-box"><span class="ans-label">投票</span><span class="ans-value">{vote_ans}</span></div>
+                <div class="ans-box community-box"><span class="ans-label">コミュニティ投票</span><span class="ans-value-sm">{vote_detail_html}</span></div>
                 <div class="ans-box ai-box"><span class="ans-label">🤖 AI解説</span><span class="ans-value-sm">{ai_html}</span></div>
                 <a href="{url}" target="_blank" class="ref-link">Discussion ↗</a>
             </div>
@@ -204,13 +252,15 @@ def main():
         body{font-family:"Segoe UI",sans-serif;background:#f0f2f5;padding:20px;color:#333} .question-card{background:#fff;max-width:850px;margin:0 auto 30px;padding:25px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
         .q-header{display:flex;justify-content:space-between;border-bottom:2px solid #eee;padding-bottom:15px;margin-bottom:15px} .q-title{font-weight:bold;color:#0056b3}
         .warning{color:#d9534f;background:#fce8e6;padding:2px 8px;border-radius:4px;font-size:0.9em;margin-left:10px;font-weight:bold}
+        .warning-community{color:#ff8c00;background:#fff3e0;padding:2px 8px;border-radius:4px;font-size:0.9em;margin-left:10px;font-weight:bold}
         .btn-group{display:flex;gap:10px} .toggle-btn{border:1px solid #ccc;background:#fff;padding:5px 15px;border-radius:20px;cursor:pointer} .answer-btn{background:#e3f2fd;color:#1565c0;font-weight:bold}
         .jp-choices li{padding:8px;margin-bottom:5px;background:#f8f9fa;border-radius:5px} .jp-letter{font-weight:bold;color:#0056b3;margin-right:10px}
         .answer-section{margin-top:20px;padding-top:15px;border-top:1px solid #eee;display:flex;gap:15px;flex-wrap:wrap}
         .ans-box{background:#f8f9fa;padding:10px;border:1px solid #ddd;border-radius:5px;text-align:center;min-width:80px}
-        .community-box{background:#e6f9ed;border-color:#c3e6cb;border-left:4px solid #28a745}
+        .community-box{background:#e6f9ed;border-color:#c3e6cb;border-left:4px solid #28a745;min-width:200px}
         .ai-box{background:#f3e5f5;border-color:#e1bee7;border-left:4px solid #8e44ad;text-align:left;flex:1;min-width:250px}
         .ans-value{font-weight:bold;font-size:1.2em} .ans-value-sm{font-size:0.95em;line-height:1.4}
+        .ans-label{display:block;font-weight:bold;margin-bottom:5px;color:#666}
         .ref-link{margin-left:auto;align-self:center;text-decoration:none;color:#007bff}
         </style><script>
         function toggleLang(id){var j=document.getElementById('jp-area-'+id),e=document.getElementById('en-area-'+id);if(j.style.display==='none'){j.style.display='block';e.style.display='none'}else{j.style.display='none';e.style.display='block'}}
