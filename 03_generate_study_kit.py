@@ -118,15 +118,33 @@ def main():
         clean_text_for_ai = ""
 
         if q_body_div:
-            clean_text_for_ai = q_body_div.get_text("\n", strip=True)
+            # ① 先にゴミを削除する
             for trash in q_body_div.find_all(['script', 'style', 'button', 'div']):
-                if trash.get('class') in [['question-answer'], ['voting-summary']]:
+                # クラス判定を少し緩くしてヒットしやすくする（in判定に変更）
+                trash_classes = trash.get('class', [])
+                if any(c in ['question-answer', 'voting-summary', 'vote-bar'] for c in trash_classes):
                     trash.decompose()
+            
+            # ② きれいになった状態でテキストを取得する
+            clean_text_for_ai = q_body_div.get_text("\n", strip=True)
             en_html = str(q_body_div)
 
             try:
                 p_text = q_body_div.find('p', class_='card-text')
                 if p_text:
+
+                    # --- 【追加】翻訳前に不要なバッジやスパンを削除する ---
+                    # 投票バッジや不要な補足テキストが含まれるクラスを指定して削除
+                    # サイトの仕様変更に対応できるよう、汎用的な span もチェック対象にするか検討が必要ですが
+                    # まずは 'vote-distribution-bar', 'badge' などを狙い撃ちします
+                    for badge in p_text.find_all(['span', 'div'], class_=['vote-distribution-bar', 'badge', 'voted-answers-tally']):
+                        badge.decompose()
+                    
+                    # 念のため、"Most Voted" というテキストを持つ要素を強力に削除
+                    for element in p_text.find_all(string=lambda text: text and "Most Voted" in text):
+                        element.parent.decompose() # そのテキストを含む親タグごと削除
+                    # ----------------------------------------------------
+
                     txt = p_text.get_text(strip=True)
                     if txt:
                         trans = translator.translate(txt)
